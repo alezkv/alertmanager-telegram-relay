@@ -1,0 +1,9 @@
+.direnv/
+.env
+.env.*
+!.env.example
+/result
+/result-*
+/bin/
+*.test
+coverage.out
