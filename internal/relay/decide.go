@@ -3,19 +3,27 @@ package relay
 import (
 	"time"
 
+	"github.com/alezkv/alertmanager-telegram-relay/internal/alertmanager"
 	"github.com/alezkv/alertmanager-telegram-relay/internal/render"
-	"github.com/alezkv/alertmanager-telegram-relay/internal/webhook"
 )
 
 type Occurrence struct {
 	Fingerprint string
 	StartsAt    time.Time
 }
+
+type StoredAlert struct {
+	Alert       alertmanager.Alert `json:"alert"`
+	ResolvedAt  *time.Time         `json:"resolved_at"`
+	MissedReads int                `json:"missed_reads"`
+}
+
 type Group struct {
-	MessageID      int64
-	ReplyMessageID int64
-	OpenedAt       time.Time
-	Webhook        webhook.Payload
+	MessageID      int64             `json:"message_id"`
+	ReplyMessageID int64             `json:"reply_message_id"`
+	OpenedAt       time.Time         `json:"opened_at"`
+	CommonLabels   map[string]string `json:"common_labels"`
+	Alerts         []StoredAlert     `json:"alerts"`
 }
 
 type ActionType string
@@ -37,8 +45,26 @@ type Action struct {
 	Group     *Group
 }
 
+// RecordReturnedID copies each successful send's ID into the SaveGroup action.
+// The handler must call it before it executes SaveGroup.
+func (a *Action) RecordReturnedID(send ActionType, id int64) {
+	if a.Type != SaveGroup || a.Group == nil {
+		return
+	}
+	switch send {
+	case SendMessage:
+		a.Group.MessageID = id
+	case SendReply:
+		a.Group.ReplyMessageID = id
+	}
+}
+
+func occurrence(a alertmanager.Alert) Occurrence {
+	return Occurrence{a.Fingerprint, a.StartsAt.UTC()}
+}
+
 // Decide returns ordered actions without changing the input state.
-func Decide(stored *Group, p webhook.Payload, now time.Time) []Action {
+func Decide(stored *Group, p alertmanager.Payload, now time.Time, loc *time.Location) []Action {
 	opened := now
 	if stored != nil {
 		opened = stored.OpenedAt
@@ -51,11 +77,56 @@ func Decide(stored *Group, p webhook.Payload, now time.Time) []Action {
 			}
 		}
 	}
-	message := render.Message(p, opened, now)
+	group := Group{OpenedAt: opened}
+	if stored != nil {
+		group = *stored
+		group.Alerts = append([]StoredAlert(nil), stored.Alerts...)
+	}
+	group.CommonLabels = p.CommonLabels
+	old := make(map[Occurrence]bool)
+	index := make(map[Occurrence]int)
+	for i, a := range group.Alerts {
+		key := occurrence(a.Alert)
+		index[key] = i
+		if a.ResolvedAt == nil && a.Alert.Status == "firing" {
+			old[key] = true
+		}
+	}
+	current := make(map[Occurrence]bool)
+	for _, a := range p.Alerts {
+		key := occurrence(a)
+		if a.Status == "firing" {
+			current[key] = true
+		}
+		entry := StoredAlert{Alert: a}
+		if a.Status == "resolved" {
+			resolved := a.EndsAt
+			if resolved.IsZero() {
+				resolved = now
+			}
+			entry.ResolvedAt = &resolved
+		}
+		if i, ok := index[key]; ok {
+			// A stale firing payload must not erase a recorded resolution.
+			if group.Alerts[i].ResolvedAt != nil && entry.ResolvedAt == nil {
+				continue
+			}
+			group.Alerts[i] = entry
+		} else {
+			index[key] = len(group.Alerts)
+			group.Alerts = append(group.Alerts, entry)
+		}
+	}
+	merged := p
+	merged.Alerts = make([]alertmanager.Alert, 0, len(group.Alerts))
+	for _, a := range group.Alerts {
+		merged.Alerts = append(merged.Alerts, a.Alert)
+	}
+	message := render.Message(merged, opened, now, loc)
 	if stored == nil {
 		actions := []Action{{Type: SendMessage, Text: message, Silent: p.Status == "resolved"}}
 		if p.Status != "resolved" {
-			actions = append(actions, Action{Type: SaveGroup, Group: &Group{OpenedAt: opened, Webhook: p}})
+			actions = append(actions, Action{Type: SaveGroup, Group: &group})
 		}
 		return actions
 	}
@@ -65,18 +136,6 @@ func Decide(stored *Group, p webhook.Payload, now time.Time) []Action {
 			actions = append(actions, Action{Type: DeleteReply, MessageID: stored.ReplyMessageID})
 		}
 		return append(actions, Action{Type: DeleteGroup})
-	}
-	old := make(map[Occurrence]bool)
-	for _, a := range stored.Webhook.Alerts {
-		if a.Status == "firing" {
-			old[Occurrence{a.Fingerprint, a.StartsAt.UTC()}] = true
-		}
-	}
-	current := make(map[Occurrence]bool)
-	for _, a := range p.Alerts {
-		if a.Status == "firing" {
-			current[Occurrence{a.Fingerprint, a.StartsAt.UTC()}] = true
-		}
 	}
 	newAlert, removed := false, false
 	for k := range current {
@@ -95,7 +154,5 @@ func Decide(stored *Group, p webhook.Payload, now time.Time) []Action {
 			actions = append(actions, Action{Type: DeleteReply, MessageID: stored.ReplyMessageID})
 		}
 	}
-	group := *stored
-	group.Webhook = p
 	return append(actions, Action{Type: SaveGroup, Group: &group})
 }

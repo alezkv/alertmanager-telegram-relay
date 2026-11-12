@@ -3,17 +3,18 @@ package render
 import (
 	"fmt"
 	"html"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf16"
 
-	"github.com/alezkv/alertmanager-telegram-relay/internal/webhook"
+	"github.com/alezkv/alertmanager-telegram-relay/internal/alertmanager"
 )
 
 const Limit = 4096
 
 // Message renders Telegram HTML. openedAt is the start of the incident.
-func Message(p webhook.Payload, openedAt, now time.Time) string {
+func Message(p alertmanager.Payload, openedAt, now time.Time, loc *time.Location) string {
 	icon := "🔥"
 	if p.Status == "resolved" {
 		icon = "✅"
@@ -31,18 +32,17 @@ func Message(p webhook.Payload, openedAt, now time.Time) string {
 		if resolved.IsZero() {
 			resolved = now
 		}
-		loc, err := time.LoadLocation("Europe/Podgorica")
-		if err != nil {
-			loc = time.UTC
-		}
 		duration := resolved.Sub(openedAt)
 		if openedAt.IsZero() || duration < 0 {
 			duration = 0
 		}
-		resolvedText = fmt.Sprintf("\nResolved: %s · Duration: %s", resolved.In(loc).Format("2006-01-02 15:04 MST"), duration.Truncate(time.Second))
+		resolvedText = fmt.Sprintf("\nResolved: %s · Duration: %s", resolved.In(loc).Format("2006-01-02 15:04 MST"), formatDuration(duration))
+	}
+	if p.TruncatedAlerts > 0 {
+		resolvedText += fmt.Sprintf("\nAlertmanager omitted %d %s", p.TruncatedAlerts, pluralAlert(p.TruncatedAlerts))
 	}
 	// Reserve space for the omission count even when the header is very long.
-	reserve := units(fmt.Sprintf("\n… %d alerts omitted", len(p.Alerts)))
+	reserve := units(omission(len(p.Alerts)))
 	if len(p.Alerts) == 0 {
 		reserve = 0
 	}
@@ -60,7 +60,25 @@ func Message(p webhook.Payload, openedAt, now time.Time) string {
 		if p.Status == "firing" && a.Status == "resolved" {
 			prefix = "✅ "
 		}
-		text := prefix + a.Annotations["summary"]
+		keys := make([]string, 0, len(a.Labels))
+		for key := range a.Labels {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		labelParts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			labelParts = append(labelParts, key+"="+a.Labels[key])
+		}
+		text := prefix + a.Labels["alertname"]
+		if len(labelParts) > 0 {
+			text += "\n" + strings.Join(labelParts, ", ")
+		}
+		if a.Annotations["summary"] != "" {
+			if text != "" && text != prefix {
+				text += "\n"
+			}
+			text += a.Annotations["summary"]
+		}
 		if a.Annotations["description"] != "" {
 			text += "\n" + a.Annotations["description"]
 		}
@@ -88,7 +106,7 @@ func Message(p webhook.Payload, openedAt, now time.Time) string {
 		remaining := len(blocks) - i - 1
 		suffix := ""
 		if remaining > 0 {
-			suffix = fmt.Sprintf("\n… %d alerts omitted", remaining)
+			suffix = omission(remaining)
 		}
 		if used+lengths[i]+units(suffix) > Limit {
 			break
@@ -98,7 +116,7 @@ func Message(p webhook.Payload, openedAt, now time.Time) string {
 		count++
 	}
 	if count < len(blocks) {
-		header += fmt.Sprintf("\n… %d alerts omitted", len(blocks)-count)
+		header += omission(len(blocks) - count)
 	}
 	return header
 }
@@ -118,4 +136,18 @@ func truncate(s string, max int) string {
 		max -= n
 	}
 	return b.String()
+}
+
+func pluralAlert(n int) string {
+	if n == 1 {
+		return "alert"
+	}
+	return "alerts"
+}
+
+func omission(n int) string { return fmt.Sprintf("\n… %d %s omitted", n, pluralAlert(n)) }
+
+func formatDuration(d time.Duration) string {
+	minutes := int64(d / time.Minute)
+	return fmt.Sprintf("%dd %dh %dm", minutes/(24*60), minutes/60%24, minutes%60)
 }
